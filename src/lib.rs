@@ -22,13 +22,10 @@ use serde::{Deserialize, Serialize};
 
 type EventLoopHandler<T> = dyn Fn(&WindowHandler<T>, ParamSetter, &mut Window) + Send + Sync;
 
-/// Persistent state for the Slint editor
+/// Window size/state that gets persisted via NIH-plug's `#[persist]` mechanism.
 ///
-/// This struct stores window size information that persists across plugin instances.
-/// Use the `#[persist = "editor-state"]` attribute on a field of this type in your
-/// plugin's parameter struct to enable automatic state persistence.
+/// Put this in your params struct so the host can save and restore the window size:
 ///
-/// # Example
 /// ```rust,ignore
 /// #[derive(Params)]
 /// struct MyParams {
@@ -38,13 +35,10 @@ type EventLoopHandler<T> = dyn Fn(&WindowHandler<T>, ParamSetter, &mut Window) +
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlintEditorState {
-    /// Window width in physical pixels
     #[serde(default = "default_width")]
     pub width: u32,
-    /// Window height in physical pixels
     #[serde(default = "default_height")]
     pub height: u32,
-    /// Scale factor for the UI (1.0 = 100%)
     #[serde(default = "default_scale")]
     pub scale_factor: f32,
 }
@@ -64,94 +58,46 @@ impl Default for SlintEditorState {
 }
 
 impl SlintEditorState {
-    /// Create a new editor state with the given size
     pub fn new(width: u32, height: u32) -> Self {
-        Self {
-            width,
-            height,
-            scale_factor: 1.0,
-        }
+        Self { width, height, scale_factor: 1.0 }
     }
 
-    /// Create a new editor state with custom scale factor
     pub fn with_scale(width: u32, height: u32, scale_factor: f32) -> Self {
-        Self {
-            width,
-            height,
-            scale_factor,
-        }
+        Self { width, height, scale_factor }
     }
 }
 
-/// A Slint based editor for NIH-plug
+/// The NIH-plug [`Editor`] implementation for Slint UIs.
 ///
-/// This struct manages the lifecycle of a Slint UI window within a NIH-plug plugin.
-/// It handles window creation, event processing, and state persistence.
-///
-/// # State Persistence
-///
-/// To enable automatic window size persistence across plugin instances, store a
-/// `SlintEditorState` in your plugin's parameter struct with the `#[persist]` attribute.
-/// Then pass a reference to it when creating the editor.
-///
-/// # Example
+/// Build one with [`SlintEditor::with_factory`], optionally chaining
+/// [`with_state`][Self::with_state] for window-size persistence and
+/// [`with_event_loop`][Self::with_event_loop] to sync parameters each frame.
 ///
 /// ```rust,ignore
-/// use nih_plug_slint::{SlintEditor, SlintEditorState};
-/// use std::sync::Arc;
-///
-/// #[derive(Params)]
-/// struct MyParams {
-///     #[persist = "editor-state"]
-///     editor_state: Arc<SlintEditorState>,
-/// }
-///
 /// fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-///     let editor_state = self.params.editor_state.clone();
-///
 ///     Some(Box::new(
-///         SlintEditor::with_factory(
-///             || gui::AppWindow::new(),
-///             (400, 300)  // Default size
-///         )
-///         .with_state(editor_state)  // Enable state persistence
-///         .with_event_loop(|handler, _setter, _window| {
-///             // Update UI here
-///         })
+///         SlintEditor::with_factory(|| gui::AppWindow::new(), (400, 300))
+///             .with_state(self.params.editor_state.clone())
+///             .with_event_loop({
+///                 let params = self.params.clone();
+///                 move |handler, _setter, _window| {
+///                     handler.component().set_gain(params.gain.value());
+///                 }
+///             }),
 ///     ))
 /// }
 /// ```
 pub struct SlintEditor<T: slint::ComponentHandle> {
-    /// Factory function to create the Slint component
     component_factory: Arc<dyn Fn() -> Result<T, slint::PlatformError> + Send + Sync>,
-    /// Current window width (updated on resize)
     width: Arc<AtomicU32>,
-    /// Current window height (updated on resize)
     height: Arc<AtomicU32>,
-    /// Optional persistent state for window size
     state: Option<Arc<SlintEditorState>>,
-    /// Event loop handler called on each frame
     event_loop_handler: Arc<EventLoopHandler<T>>,
 }
 
 impl<T: slint::ComponentHandle + 'static> SlintEditor<T> {
-    /// Create a new Slint editor with a factory function
-    ///
-    /// This is useful when you need to create fresh instances of the component.
-    /// The factory is called each time the window is opened.
-    ///
-    /// # Arguments
-    /// * `factory` - Function that creates a new Slint component
-    /// * `size` - Default window size (width, height) in physical pixels
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// SlintEditor::with_factory(
-    ///     || gui::AppWindow::new(),
-    ///     (400, 300)
-    /// )
-    /// ```
+    /// Create an editor from a factory closure.  `size` is the default window size in
+    /// logical pixels; it's overridden by the persisted state if you call [`with_state`][Self::with_state].
     pub fn with_factory<F>(factory: F, size: (u32, u32)) -> Self
     where
         F: Fn() -> Result<T, slint::PlatformError> + 'static + Send + Sync,
@@ -165,64 +111,17 @@ impl<T: slint::ComponentHandle + 'static> SlintEditor<T> {
         }
     }
 
-    /// Attach a persistent state to enable window size persistence
-    ///
-    /// When a state is attached, the editor will:
-    /// - Load the saved window size when opening
-    /// - Save the window size when resizing
-    ///
-    /// # Arguments
-    /// * `state` - Arc to a `SlintEditorState` that should be stored in your
-    ///   plugin's params struct with `#[persist = "editor-state"]`
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// SlintEditor::with_factory(|| gui::AppWindow::new(), (400, 300))
-    ///     .with_state(self.params.editor_state.clone())
-    /// ```
+    /// Load the initial window size from `state` and write back to it on resize.
+    /// Pass an `Arc<SlintEditorState>` stored under `#[persist]` in your params.
     pub fn with_state(mut self, state: Arc<SlintEditorState>) -> Self {
-        // Load size from state
         self.width = Arc::new(AtomicU32::new(state.width));
         self.height = Arc::new(AtomicU32::new(state.height));
         self.state = Some(state);
         self
     }
 
-    /// Set a custom event loop handler
-    ///
-    /// This handler is called on every frame and allows you to:
-    /// - Update UI based on parameter changes (Plugin -> UI)
-    /// - Set up callbacks for UI events (UI -> Plugin)
-    /// - Sync any other state between plugin and UI
-    ///
-    /// The handler receives:
-    /// - `WindowHandler<T>`: Access to the Slint component and window
-    /// - `ParamSetter`: For setting plugin parameters from the UI
-    /// - `&mut Window`: The baseview window (rarely needed directly)
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// .with_event_loop({
-    ///     let params = self.params.clone();
-    ///     move |window_handler, _setter, _window| {
-    ///         let component = window_handler.component();
-    ///
-    ///         // Plugin -> UI: Update UI with parameter values
-    ///         let threshold = params.threshold.unmodulated_normalized_value();
-    ///         component.set_threshold_value(threshold);
-    ///
-    ///         // UI -> Plugin: Set up callbacks
-    ///         let params_clone = params.clone();
-    ///         let context = window_handler.context().clone();
-    ///         component.on_threshold_changed(move |value| {
-    ///             let setter = ParamSetter::new(&*context);
-    ///             setter.set_parameter_normalized(&params_clone.threshold, value);
-    ///         });
-    ///     }
-    /// })
-    /// ```
+    /// Set the handler called every frame. Use it to push parameter values to the UI
+    /// and register Slint callbacks for UI → plugin communication.
     pub fn with_event_loop<F>(mut self, handler: F) -> Self
     where
         F: Fn(&WindowHandler<T>, ParamSetter, &mut baseview::Window) + 'static + Send + Sync,
@@ -232,17 +131,47 @@ impl<T: slint::ComponentHandle + 'static> SlintEditor<T> {
     }
 }
 
-/// OpenGL interface implementation for baseview
-struct BaseviewOpenGLInterface;
+/// OpenGL interface implementation for baseview.
+///
+/// Delegates all GL symbol resolution to baseview's `GlContext::get_proc_address`,
+/// which handles the platform-specific details (WGL on Windows, dlsym on Unix).
+///
+/// The inner function is stored in an `Arc` so this type can be cheaply cloned
+/// when the `FemtoVGRenderer` is created from inside `WindowAdapter::renderer()`.
+#[derive(Clone)]
+struct BaseviewOpenGLInterface {
+    get_proc_address: Arc<dyn Fn(&str) -> *const core::ffi::c_void + Send + Sync>,
+}
+
+impl BaseviewOpenGLInterface {
+    fn new(window: &baseview::Window) -> Self {
+        // Store the GlContext address as a plain usize so that the closure is Send + Sync.
+        //
+        // SAFETY: The `GlContext` is owned by the `Window` and lives as long as the window is
+        // open.  The `FemtoVGRenderer` (and therefore this interface) is dropped before the
+        // window closes, so the pointer is valid for the entire lifetime of the renderer.
+        // We only dereference it on the GUI thread (inside FemtoVG's GL loader callback).
+        let ctx_addr = window.gl_context().expect("window must have an OpenGL context")
+            as *const baseview::gl::GlContext as usize;
+
+        Self {
+            get_proc_address: Arc::new(move |name: &str| {
+                let ctx = ctx_addr as *const baseview::gl::GlContext;
+                // SAFETY: see constructor comment above.
+                unsafe { &*ctx }.get_proc_address(name)
+            }),
+        }
+    }
+}
 
 unsafe impl slint::platform::femtovg_renderer::OpenGLInterface for BaseviewOpenGLInterface {
     fn ensure_current(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // baseview ensures the context is current before calling on_frame
+        // baseview makes the context current before calling on_frame
         Ok(())
     }
 
     fn swap_buffers(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // baseview handles buffer swapping
+        // baseview handles buffer swapping (we call swap_buffers manually at end of frame)
         Ok(())
     }
 
@@ -251,95 +180,21 @@ unsafe impl slint::platform::femtovg_renderer::OpenGLInterface for BaseviewOpenG
         _width: core::num::NonZeroU32,
         _height: core::num::NonZeroU32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Resize is handled through the WindowAdapter
+        // Resize is handled via WindowAdapter::size()
         Ok(())
     }
 
     fn get_proc_address(&self, name: &core::ffi::CStr) -> *const core::ffi::c_void {
-        // Use glutin's GL loader to get OpenGL function pointers
-        // This works across platforms (Windows/macOS/Linux)
-        #[cfg(target_os = "windows")]
-        {
-            // On Windows, use wglGetProcAddress for extension functions
-            // and GetProcAddress for core functions
-            unsafe {
-                // First check for OpenGL 1.1 core functions from opengl32.dll
-                // These MUST come from the DLL, not wglGetProcAddress
-                let opengl32 = LoadLibraryA(b"opengl32.dll\0".as_ptr());
-                if !opengl32.is_null() {
-                    let proc_addr = GetProcAddress(opengl32, name.as_ptr());
-                    if !proc_addr.is_null() {
-                        // Found in opengl32.dll (OpenGL 1.1 core function)
-                        return proc_addr as *const core::ffi::c_void;
-                    }
-                }
-
-                // Try wglGetProcAddress for extensions and OpenGL 1.2+ functions
-                let addr = wglGetProcAddress(name.as_ptr());
-
-                // CRITICAL: wglGetProcAddress can return invalid non-null pointers!
-                // According to OpenGL Wiki and Windows docs, it can return 1, 2, 3, or -1
-                // on failure instead of NULL. We must check for all these values.
-                let addr_int = addr as usize;
-                if addr_int != 0 && addr_int != 1 && addr_int != 2 && addr_int != 3 && addr_int != usize::MAX {
-                    return addr as *const core::ffi::c_void;
-                }
-            }
-        }
-
-        // This hasnt been tested this is just my best guess
-        // based on how dynamic loading works on macOS and Linux
-        #[cfg(target_os = "macos")]
-        {
-            // On macOS, use dlsym to load OpenGL functions from the OpenGL framework
-            unsafe {
-                // RTLD_DEFAULT searches all loaded libraries
-                const RTLD_DEFAULT: *mut core::ffi::c_void = -2isize as *mut core::ffi::c_void;
-                let addr = dlsym(RTLD_DEFAULT, name.as_ptr());
-                if !addr.is_null() {
-                    return addr;
-                }
-            }
-        }
-
-        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-        {
-            // On Linux/other Unix, use dlsym to load OpenGL functions
-            unsafe {
-                const RTLD_DEFAULT: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
-                let addr = dlsym(RTLD_DEFAULT, name.as_ptr());
-                if !addr.is_null() {
-                    return addr;
-                }
-            }
-        }
-
-        std::ptr::null()
+        let name = name.to_str().unwrap_or("");
+        (self.get_proc_address)(name)
     }
 }
 
-// Platform-specific OpenGL function loading
-
-// Windows-specific functions
-#[cfg(target_os = "windows")]
-extern "system" {
-    fn wglGetProcAddress(name: *const i8) -> *const core::ffi::c_void;
-    fn GetProcAddress(module: *mut core::ffi::c_void, name: *const i8) -> *const core::ffi::c_void;
-    fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
-}
-
-// macOS and Linux use dlsym from libdl
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-extern "C" {
-    fn dlsym(handle: *mut core::ffi::c_void, symbol: *const i8) -> *mut core::ffi::c_void;
-}
-
 // Thread-local storage for the current adapter
-// This allows us to update the adapter when reopening the window
+// Holds the active adapter so that BaseviewSlintPlatform::create_window_adapter can
+// return it.  Updated each time a window is opened.
 thread_local! {
     static CURRENT_ADAPTER: RefCell<Option<Rc<BaseviewSlintAdapter>>> = RefCell::new(None);
-    // Track whether GL context is current - prevents renderer creation before on_frame
-    static GL_CONTEXT_READY: RefCell<bool> = RefCell::new(false);
 }
 
 /// Platform implementation for Slint
@@ -364,22 +219,27 @@ struct BaseviewSlintAdapter {
     physical_size: RefCell<PhysicalSize>,
     /// Scale factor (e.g., 2.0 on Retina displays)
     scale_factor: RefCell<f32>,
+    /// Stored proc-address loader, set once the GL context is available
+    gl_interface: OnceCell<BaseviewOpenGLInterface>,
 }
 
 impl BaseviewSlintAdapter {
     fn new(physical_width: u32, physical_height: u32, scale_factor: f32) -> Rc<Self> {
         Rc::new_cyclic(|weak_self| {
             let window = slint::Window::new(weak_self.clone() as _);
-            // Don't create the renderer yet - wait until GL context is active
-            // This will be lazily initialized on first render call
-
             Self {
                 window,
                 renderer: OnceCell::new(),
                 physical_size: RefCell::new(PhysicalSize::new(physical_width, physical_height)),
                 scale_factor: RefCell::new(scale_factor),
+                gl_interface: OnceCell::new(),
             }
         })
+    }
+
+    /// Call once after the GL context is live to wire up the proc-address loader.
+    fn set_gl_context(&self, window: &baseview::Window) {
+        let _ = self.gl_interface.set(BaseviewOpenGLInterface::new(window));
     }
 
     /// Update the size and scale factor (called when window is resized or scale changes)
@@ -399,17 +259,10 @@ impl WindowAdapter for BaseviewSlintAdapter {
     }
 
     fn renderer(&self) -> &dyn slint::platform::Renderer {
-        // Lazy initialization: create renderer on first access when GL context is active
         self.renderer.get_or_init(|| {
-            // Check if GL context is ready
-            let context_ready = GL_CONTEXT_READY.with(|ready| *ready.borrow());
-            if !context_ready {
-                panic!("CRITICAL: Slint tried to create renderer before GL context was ready! \
-                       This means Slint 1.14.1 is calling renderer() during component creation, \
-                       not during rendering. This is incompatible with baseview integration.");
-            }
-
-            FemtoVGRenderer::new(BaseviewOpenGLInterface)
+            let interface = self.gl_interface.get()
+                .expect("GL context must be set via set_gl_context() before renderer() is called");
+            FemtoVGRenderer::new(interface.clone())
                 .expect("Failed to create FemtoVG renderer")
         })
     }
@@ -419,49 +272,24 @@ impl WindowAdapter for BaseviewSlintAdapter {
     }
 }
 
-/// Handler for the baseview window containing the Slint UI
-///
-/// This struct manages the per-window state and event handling for a Slint UI instance.
-/// It's created when the window is opened and destroyed when it's closed.
+/// Per-window state, passed to the event loop handler each frame.
 pub struct WindowHandler<T: slint::ComponentHandle> {
-    /// NIH-plug GUI context for parameter operations and host communication
     context: Arc<dyn GuiContext>,
-    /// User-provided event loop handler called on each frame
     event_loop_handler: Arc<EventLoopHandler<T>>,
-    /// Current window width in logical pixels (updated on resize)
     pub width: Arc<AtomicU32>,
-    /// Current window height in logical pixels (updated on resize)
     pub height: Arc<AtomicU32>,
-    /// Current scale factor (e.g., 2.0 on Retina displays)
     scale_factor: RefCell<f32>,
-    /// Optional persistent state for saving window size
     state: Option<Arc<SlintEditorState>>,
-    /// GUI-thread only resize queue - uses RefCell instead of Mutex since it never crosses threads
-    /// Wrapped in Rc to allow sharing with callbacks
+    // Rc so it can be shared with Slint callbacks without needing &mut self
     pending_resizes: Rc<RefCell<Vec<(u32, u32)>>>,
-    /// Track last cursor position for button events
     last_cursor_pos: RefCell<LogicalPosition>,
-    /// Track if window has been shown (deferred until first frame when GL context is active)
     window_shown: RefCell<bool>,
-    /// Slint component instance
     component: T,
-    /// Window adapter that bridges baseview and Slint
     adapter: Rc<BaseviewSlintAdapter>,
 }
 
 impl<T: slint::ComponentHandle> WindowHandler<T> {
-    /// Resize the window and optionally persist the new size
-    ///
-    /// This method:
-    /// 1. Updates the internal width/height atomics (logical size)
-    /// 2. Updates the Slint adapter's physical size
-    /// 3. Notifies Slint window of new size
-    /// 4. Notifies the host that resize is requested
-    /// 5. Actually resizes the baseview window
-    /// 6. If state persistence is enabled, saves the new size
-    ///
-    /// Note: width and height are in LOGICAL pixels (what the user sees).
-    /// Physical pixels = logical * scale_factor
+    /// Resize the window. `width` and `height` are in logical pixels.
     pub fn resize(&self, window: &mut baseview::Window, width: u32, height: u32) {
         let scale = *self.scale_factor.borrow();
         let physical_width = (width as f32 * scale) as u32;
@@ -492,10 +320,14 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
             height: height as f64,
         });
 
-        // Persist the new size if state is available
+        // Persist the new size if state is available.
+        //
+        // SAFETY: We write through an Arc that is shared with the audio thread.
+        // This is technically a data race if the audio thread reads width/height concurrently.
+        // In practice NIH-plug only reads these fields from the GUI thread (in `spawn`),
+        // so there is no concurrent access.  A future improvement would be to store these
+        // as `AtomicU32` fields inside `SlintEditorState`.
         if let Some(state) = &self.state {
-            // Safe to use unsafe here because SlintEditorState only contains primitive types
-            // and we need to update the Arc without mut reference
             let state_ptr = Arc::as_ptr(state) as *mut SlintEditorState;
             unsafe {
                 (*state_ptr).width = width;
@@ -530,20 +362,17 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
         });
     }
 
-    /// Queue a resize request to be processed later
-    /// This allows deferring resize operations to avoid borrow checker conflicts
+    /// Queue a resize to be applied next frame. Use this from Slint callbacks where
+    /// you don't have access to `&mut Window`.
     pub fn queue_resize(&self, width: u32, height: u32) {
         self.pending_resizes.borrow_mut().push((width, height));
     }
 
-    /// Get access to the pending resizes queue for direct manipulation
-    /// This is useful when you need to queue resizes from callbacks
+    /// Returns the resize queue so you can clone the `Rc` and push to it from callbacks.
     pub fn pending_resizes(&self) -> &Rc<RefCell<Vec<(u32, u32)>>> {
         &self.pending_resizes
     }
 
-    /// Process any pending resize requests
-    /// Returns the size that was applied, if any
     pub fn process_pending_resizes(&self, window: &mut baseview::Window) -> Option<(u32, u32)> {
         let mut queue = self.pending_resizes.borrow_mut();
         if let Some((width, height)) = queue.pop() {
@@ -558,38 +387,28 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
         }
     }
 
-    /// Get reference to the Slint component
     pub fn component(&self) -> &T {
         &self.component
     }
 
-    /// Get reference to the Slint window
     pub fn window(&self) -> &slint::Window {
         &self.adapter.window
     }
 
-    /// Get reference to the GUI context for parameter operations
     pub fn context(&self) -> &Arc<dyn GuiContext> {
         &self.context
     }
 
-    /// Helper to set a parameter value from the UI
-    ///
-    /// # Arguments
-    /// * `param` - The parameter to set
-    /// * `normalized` - The normalized value (0.0 to 1.0)
     pub fn set_parameter_normalized(&self, param: &impl nih_plug::prelude::Param, normalized: f32) {
         let setter = ParamSetter::new(&*self.context);
         setter.set_parameter_normalized(param, normalized);
     }
 
-    /// Helper to begin parameter gesture (for automation recording)
     pub fn begin_set_parameter(&self, param: &impl nih_plug::prelude::Param) {
         let setter = ParamSetter::new(&*self.context);
         setter.begin_set_parameter(param);
     }
 
-    /// Helper to end parameter gesture
     pub fn end_set_parameter(&self, param: &impl nih_plug::prelude::Param) {
         let setter = ParamSetter::new(&*self.context);
         setter.end_set_parameter(param);
@@ -598,24 +417,22 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
 
 impl<T: slint::ComponentHandle> baseview::WindowHandler for WindowHandler<T> {
     fn on_frame(&mut self, window: &mut baseview::Window) {
-        // Explicitly make GL context current at the start of every frame
-        unsafe {
-            window.gl_context().unwrap().make_current();
-        }
+        // Make the GL context current for this frame.
+        unsafe { window.gl_context().unwrap().make_current() };
 
-        // Mark GL context as ready - this allows renderer creation
-        GL_CONTEXT_READY.with(|ready| *ready.borrow_mut() = true);
-
-        // Show the Slint window on first frame when GL context is NOW active
+        // On first frame: initialize the renderer and show the component.
+        // We defer this until on_frame (rather than doing it in spawn's closure)
+        // so the GL context is guaranteed to be current when FemtoVG queries GL_VERSION.
         if !*self.window_shown.borrow() {
-            // IMPORTANT: Initialize the renderer BEFORE calling show()
-            // Context is current, so FemtoVG can query GL_VERSION
+            self.adapter.set_gl_context(window);
             let _ = self.adapter.renderer.get_or_init(|| {
-                FemtoVGRenderer::new(BaseviewOpenGLInterface)
-                    .expect("Failed to create FemtoVG renderer")
+                self.adapter.gl_interface.get()
+                    .map(|iface| {
+                        FemtoVGRenderer::new(iface.clone())
+                            .expect("Failed to create FemtoVG renderer")
+                    })
+                    .expect("gl_interface must be set before renderer init")
             });
-
-            // Show the component's window (which uses our adapter)
             self.component.show().expect("Failed to show component");
             *self.window_shown.borrow_mut() = true;
         }
@@ -732,6 +549,10 @@ impl Drop for Instance {
     }
 }
 
+// SAFETY: `Instance` only contains a `WindowHandle`, which is not `Send` because it holds
+// a raw pointer to the platform window.  However, we only ever close the window from the
+// audio thread (via `Drop`), and baseview guarantees that `WindowHandle::close` is safe to
+// call from any thread.
 unsafe impl Send for Instance {}
 
 impl<T: slint::ComponentHandle + 'static> Editor for SlintEditor<T> {
@@ -771,45 +592,35 @@ impl<T: slint::ComponentHandle + 'static> Editor for SlintEditor<T> {
         let component_factory = self.component_factory.clone();
 
         let window_handle = baseview::Window::open_parented(&parent, options, move |baseview_window| {
-            // CRITICAL FOR SLINT 1.14.1: Make GL context current BEFORE creating Slint components
-            // Slint 1.14.1 tries to create the renderer during component initialization,
-            // not lazily during first render as 1.8.0 did
-            unsafe {
-                baseview_window.gl_context().unwrap().make_current();
-            }
+            // Make the GL context current so that any renderer creation during component
+            // initialization (Slint may call renderer() eagerly) has a valid context.
+            unsafe { baseview_window.gl_context().unwrap().make_current() };
 
-            // Mark GL context as ready - allows renderer creation
-            GL_CONTEXT_READY.with(|ready| *ready.borrow_mut() = true);
-
-            // Create the Slint window adapter
-            // Initially use scale factor 1.0 - this will be updated when we receive
-            // the first WindowEvent::Resized from baseview with the actual scale factor
+            // Create the Slint window adapter.
+            // Start with scale 1.0; the actual system scale arrives via the first
+            // WindowEvent::Resized from baseview.
             let initial_scale = 1.0f32;
             let logical_width = width.load(Ordering::Relaxed);
             let logical_height = height.load(Ordering::Relaxed);
-            // Start with logical = physical, will be corrected on first resize event
-            let adapter = BaseviewSlintAdapter::new(
-                logical_width,
-                logical_height,
-                initial_scale,
-            );
+            let adapter = BaseviewSlintAdapter::new(logical_width, logical_height, initial_scale);
 
-            // Set the adapter in thread-local storage
+            // Wire up the GL proc-address loader now that the context is live.
+            adapter.set_gl_context(baseview_window);
+
+            // Register this adapter so BaseviewSlintPlatform::create_window_adapter returns it.
             CURRENT_ADAPTER.with(|current| {
                 *current.borrow_mut() = Some(adapter.clone());
             });
 
-            // Set our custom platform - this tells Slint to use our adapter
-            // On first open, this sets the platform; on subsequent opens,
-            // the adapter is already updated above via thread-local storage
+            // Install our platform on first open; ignored (returns Err) on subsequent opens
+            // since Slint only allows setting the platform once per process.
             let _ = slint::platform::set_platform(Box::new(BaseviewSlintPlatform));
 
-            // Create the Slint component
-            // NOTE: In Slint 1.14.1, this will trigger renderer() to be called immediately
             let component = component_factory()
                 .unwrap_or_else(|e| panic!("Failed to create Slint component: {}", e));
 
-            // Don't show the window yet - defer until first on_frame when GL context is active
+            // Defer show() until on_frame so the GL context is current when FemtoVG
+            // queries GL_VERSION during its first render.
 
             WindowHandler {
                 context,
