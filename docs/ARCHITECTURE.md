@@ -69,4 +69,4 @@ There are two resize paths:
 
 **Plugin → UI:** Read parameter values in the `with_event_loop` handler and push them to Slint component properties each frame.
 
-**UI → Plugin:** Register Slint callbacks (e.g. `component.on_gain_changed(...)`) in the event loop handler. It's fine to re-register them every frame. Inside the callback, use `ParamSetter` to update the parameter.
+**UI → Plugin:** Register Slint callbacks (e.g. `component.on_gain_changed(...)`) using `with_setup`. This runs once when the window first opens, before the event loop starts. Prefer this over registering callbacks in `with_event_loop`, since re-registering every frame is wasteful even if harmless. 
