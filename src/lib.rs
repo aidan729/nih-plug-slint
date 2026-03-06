@@ -1,4 +1,8 @@
-use baseview::{Event, Size, Window, WindowEvent as BaseviewWindowEvent, WindowHandle, WindowInfo, WindowOpenOptions, WindowScalePolicy, gl::GlConfig};
+use baseview::{
+    gl::GlConfig, Event, Size, Window, WindowEvent as BaseviewWindowEvent, WindowHandle,
+    WindowInfo, WindowOpenOptions, WindowScalePolicy,
+};
+use nih_plug::params::Param;
 use nih_plug::prelude::{Editor, GuiContext, ParamSetter};
 use once_cell::unsync::OnceCell;
 use slint::platform::femtovg_renderer::FemtoVGRenderer;
@@ -21,6 +25,7 @@ pub use slint;
 use serde::{Deserialize, Serialize};
 
 type EventLoopHandler<T> = dyn Fn(&WindowHandler<T>, ParamSetter, &mut Window) + Send + Sync;
+type SetupHandler<T> = dyn Fn(&WindowHandler<T>, &mut Window) + Send + Sync;
 
 /// Window size/state that gets persisted via NIH-plug's `#[persist]` mechanism.
 ///
@@ -43,9 +48,15 @@ pub struct SlintEditorState {
     pub scale_factor: f32,
 }
 
-fn default_width() -> u32 { 400 }
-fn default_height() -> u32 { 300 }
-fn default_scale() -> f32 { 1.0 }
+fn default_width() -> u32 {
+    400
+}
+fn default_height() -> u32 {
+    300
+}
+fn default_scale() -> f32 {
+    1.0
+}
 
 impl Default for SlintEditorState {
     fn default() -> Self {
@@ -59,11 +70,19 @@ impl Default for SlintEditorState {
 
 impl SlintEditorState {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, scale_factor: 1.0 }
+        Self {
+            width,
+            height,
+            scale_factor: 1.0,
+        }
     }
 
     pub fn with_scale(width: u32, height: u32, scale_factor: f32) -> Self {
-        Self { width, height, scale_factor }
+        Self {
+            width,
+            height,
+            scale_factor,
+        }
     }
 }
 
@@ -93,6 +112,7 @@ pub struct SlintEditor<T: slint::ComponentHandle> {
     height: Arc<AtomicU32>,
     state: Option<Arc<SlintEditorState>>,
     event_loop_handler: Arc<EventLoopHandler<T>>,
+    setup_handler: Arc<SetupHandler<T>>,
 }
 
 impl<T: slint::ComponentHandle + 'static> SlintEditor<T> {
@@ -108,6 +128,7 @@ impl<T: slint::ComponentHandle + 'static> SlintEditor<T> {
             height: Arc::new(AtomicU32::new(size.1)),
             state: None,
             event_loop_handler: Arc::new(|_, _, _| {}),
+            setup_handler: Arc::new(|_, _| {}),
         }
     }
 
@@ -120,11 +141,19 @@ impl<T: slint::ComponentHandle + 'static> SlintEditor<T> {
         self
     }
 
+    pub fn with_setup<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&WindowHandler<T>, &mut Window) + 'static + Send + Sync,
+    {
+        self.setup_handler = Arc::new(handler);
+        self
+    }
+
     /// Set the handler called every frame. Use it to push parameter values to the UI
     /// and register Slint callbacks for UI → plugin communication.
     pub fn with_event_loop<F>(mut self, handler: F) -> Self
     where
-        F: Fn(&WindowHandler<T>, ParamSetter, &mut baseview::Window) + 'static + Send + Sync,
+        F: Fn(&WindowHandler<T>, ParamSetter, &mut Window) + 'static + Send + Sync,
     {
         self.event_loop_handler = Arc::new(handler);
         self
@@ -151,7 +180,9 @@ impl BaseviewOpenGLInterface {
         // open.  The `FemtoVGRenderer` (and therefore this interface) is dropped before the
         // window closes, so the pointer is valid for the entire lifetime of the renderer.
         // We only dereference it on the GUI thread (inside FemtoVG's GL loader callback).
-        let ctx_addr = window.gl_context().expect("window must have an OpenGL context")
+        let ctx_addr = window
+            .gl_context()
+            .expect("window must have an OpenGL context")
             as *const baseview::gl::GlContext as usize;
 
         Self {
@@ -203,7 +234,8 @@ struct BaseviewSlintPlatform;
 impl slint::platform::Platform for BaseviewSlintPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
         CURRENT_ADAPTER.with(|adapter| {
-            adapter.borrow()
+            adapter
+                .borrow()
                 .clone()
                 .map(|a| a as Rc<dyn WindowAdapter>)
                 .ok_or_else(|| slint::PlatformError::Other("No adapter set".into()))
@@ -260,10 +292,11 @@ impl WindowAdapter for BaseviewSlintAdapter {
 
     fn renderer(&self) -> &dyn slint::platform::Renderer {
         self.renderer.get_or_init(|| {
-            let interface = self.gl_interface.get()
+            let interface = self
+                .gl_interface
+                .get()
                 .expect("GL context must be set via set_gl_context() before renderer() is called");
-            FemtoVGRenderer::new(interface.clone())
-                .expect("Failed to create FemtoVG renderer")
+            FemtoVGRenderer::new(interface.clone()).expect("Failed to create FemtoVG renderer")
         })
     }
 
@@ -276,6 +309,7 @@ impl WindowAdapter for BaseviewSlintAdapter {
 pub struct WindowHandler<T: slint::ComponentHandle> {
     context: Arc<dyn GuiContext>,
     event_loop_handler: Arc<EventLoopHandler<T>>,
+    setup_handler: Arc<SetupHandler<T>>,
     pub width: Arc<AtomicU32>,
     pub height: Arc<AtomicU32>,
     scale_factor: RefCell<f32>,
@@ -299,7 +333,8 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
         self.height.store(height, Ordering::Relaxed);
 
         // Update adapter with physical size and scale factor
-        self.adapter.update_size(physical_width, physical_height, scale);
+        self.adapter
+            .update_size(physical_width, physical_height, scale);
 
         // Notify Slint window of new size to trigger re-layout
         // Slint expects logical size here
@@ -344,22 +379,32 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
         *self.scale_factor.borrow_mut() = scale;
 
         // Update adapter with physical size
-        self.adapter.update_size(physical_size.width, physical_size.height, scale);
+        self.adapter
+            .update_size(physical_size.width, physical_size.height, scale);
 
         // Update our logical size tracking
         let logical_size = info.logical_size();
-        self.width.store(logical_size.width as u32, Ordering::Relaxed);
-        self.height.store(logical_size.height as u32, Ordering::Relaxed);
+        self.width
+            .store(logical_size.width as u32, Ordering::Relaxed);
+        self.height
+            .store(logical_size.height as u32, Ordering::Relaxed);
 
         // Notify Slint of the new size (logical)
-        self.adapter.window.dispatch_event(slint::platform::WindowEvent::Resized {
-            size: slint::LogicalSize::new(logical_size.width as f32, logical_size.height as f32),
-        });
+        self.adapter
+            .window
+            .dispatch_event(slint::platform::WindowEvent::Resized {
+                size: slint::LogicalSize::new(
+                    logical_size.width as f32,
+                    logical_size.height as f32,
+                ),
+            });
 
         // Also set the scale factor on the Slint window
-        self.adapter.window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
-            scale_factor: scale,
-        });
+        self.adapter
+            .window
+            .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+                scale_factor: scale,
+            });
     }
 
     /// Queue a resize to be applied next frame. Use this from Slint callbacks where
@@ -426,7 +471,9 @@ impl<T: slint::ComponentHandle> baseview::WindowHandler for WindowHandler<T> {
         if !*self.window_shown.borrow() {
             self.adapter.set_gl_context(window);
             let _ = self.adapter.renderer.get_or_init(|| {
-                self.adapter.gl_interface.get()
+                self.adapter
+                    .gl_interface
+                    .get()
                     .map(|iface| {
                         FemtoVGRenderer::new(iface.clone())
                             .expect("Failed to create FemtoVG renderer")
@@ -435,6 +482,9 @@ impl<T: slint::ComponentHandle> baseview::WindowHandler for WindowHandler<T> {
             });
             self.component.show().expect("Failed to show component");
             *self.window_shown.borrow_mut() = true;
+
+            // This fires once, allowing users to register parameter update callbacks for UI -> plugin one time before the event loop starts
+            (self.setup_handler)(self, window);
         }
 
         // Call custom event loop handler first
@@ -479,9 +529,15 @@ impl<T: slint::ComponentHandle> baseview::WindowHandler for WindowHandler<T> {
                     }
                     baseview::MouseEvent::ButtonPressed { button, .. } => {
                         let slint_button = match button {
-                            baseview::MouseButton::Left => slint::platform::PointerEventButton::Left,
-                            baseview::MouseButton::Right => slint::platform::PointerEventButton::Right,
-                            baseview::MouseButton::Middle => slint::platform::PointerEventButton::Middle,
+                            baseview::MouseButton::Left => {
+                                slint::platform::PointerEventButton::Left
+                            }
+                            baseview::MouseButton::Right => {
+                                slint::platform::PointerEventButton::Right
+                            }
+                            baseview::MouseButton::Middle => {
+                                slint::platform::PointerEventButton::Middle
+                            }
                             _ => return EventStatus::Ignored,
                         };
                         WindowEvent::PointerPressed {
@@ -491,9 +547,15 @@ impl<T: slint::ComponentHandle> baseview::WindowHandler for WindowHandler<T> {
                     }
                     baseview::MouseEvent::ButtonReleased { button, .. } => {
                         let slint_button = match button {
-                            baseview::MouseButton::Left => slint::platform::PointerEventButton::Left,
-                            baseview::MouseButton::Right => slint::platform::PointerEventButton::Right,
-                            baseview::MouseButton::Middle => slint::platform::PointerEventButton::Middle,
+                            baseview::MouseButton::Left => {
+                                slint::platform::PointerEventButton::Left
+                            }
+                            baseview::MouseButton::Right => {
+                                slint::platform::PointerEventButton::Right
+                            }
+                            baseview::MouseButton::Middle => {
+                                slint::platform::PointerEventButton::Middle
+                            }
                             _ => return EventStatus::Ignored,
                         };
                         WindowEvent::PointerReleased {
@@ -589,53 +651,57 @@ impl<T: slint::ComponentHandle + 'static> Editor for SlintEditor<T> {
         let height = self.height.clone();
         let state = self.state.clone();
         let event_loop_handler = self.event_loop_handler.clone();
+        let setup_handler = self.setup_handler.clone();
         let component_factory = self.component_factory.clone();
 
-        let window_handle = baseview::Window::open_parented(&parent, options, move |baseview_window| {
-            // Make the GL context current so that any renderer creation during component
-            // initialization (Slint may call renderer() eagerly) has a valid context.
-            unsafe { baseview_window.gl_context().unwrap().make_current() };
+        let window_handle =
+            baseview::Window::open_parented(&parent, options, move |baseview_window| {
+                // Make the GL context current so that any renderer creation during component
+                // initialization (Slint may call renderer() eagerly) has a valid context.
+                unsafe { baseview_window.gl_context().unwrap().make_current() };
 
-            // Create the Slint window adapter.
-            // Start with scale 1.0; the actual system scale arrives via the first
-            // WindowEvent::Resized from baseview.
-            let initial_scale = 1.0f32;
-            let logical_width = width.load(Ordering::Relaxed);
-            let logical_height = height.load(Ordering::Relaxed);
-            let adapter = BaseviewSlintAdapter::new(logical_width, logical_height, initial_scale);
+                // Create the Slint window adapter.
+                // Start with scale 1.0; the actual system scale arrives via the first
+                // WindowEvent::Resized from baseview.
+                let initial_scale = 1.0f32;
+                let logical_width = width.load(Ordering::Relaxed);
+                let logical_height = height.load(Ordering::Relaxed);
+                let adapter =
+                    BaseviewSlintAdapter::new(logical_width, logical_height, initial_scale);
 
-            // Wire up the GL proc-address loader now that the context is live.
-            adapter.set_gl_context(baseview_window);
+                // Wire up the GL proc-address loader now that the context is live.
+                adapter.set_gl_context(baseview_window);
 
-            // Register this adapter so BaseviewSlintPlatform::create_window_adapter returns it.
-            CURRENT_ADAPTER.with(|current| {
-                *current.borrow_mut() = Some(adapter.clone());
+                // Register this adapter so BaseviewSlintPlatform::create_window_adapter returns it.
+                CURRENT_ADAPTER.with(|current| {
+                    *current.borrow_mut() = Some(adapter.clone());
+                });
+
+                // Install our platform on first open; ignored (returns Err) on subsequent opens
+                // since Slint only allows setting the platform once per process.
+                let _ = slint::platform::set_platform(Box::new(BaseviewSlintPlatform));
+
+                let component = component_factory()
+                    .unwrap_or_else(|e| panic!("Failed to create Slint component: {}", e));
+
+                // Defer show() until on_frame so the GL context is current when FemtoVG
+                // queries GL_VERSION during its first render.
+
+                WindowHandler {
+                    context,
+                    event_loop_handler,
+                    setup_handler,
+                    width,
+                    height,
+                    scale_factor: RefCell::new(initial_scale),
+                    state,
+                    pending_resizes: Rc::new(RefCell::new(Vec::new())),
+                    last_cursor_pos: RefCell::new(LogicalPosition::new(0.0, 0.0)),
+                    window_shown: RefCell::new(false),
+                    component,
+                    adapter,
+                }
             });
-
-            // Install our platform on first open; ignored (returns Err) on subsequent opens
-            // since Slint only allows setting the platform once per process.
-            let _ = slint::platform::set_platform(Box::new(BaseviewSlintPlatform));
-
-            let component = component_factory()
-                .unwrap_or_else(|e| panic!("Failed to create Slint component: {}", e));
-
-            // Defer show() until on_frame so the GL context is current when FemtoVG
-            // queries GL_VERSION during its first render.
-
-            WindowHandler {
-                context,
-                event_loop_handler,
-                width,
-                height,
-                scale_factor: RefCell::new(initial_scale),
-                state,
-                pending_resizes: Rc::new(RefCell::new(Vec::new())),
-                last_cursor_pos: RefCell::new(LogicalPosition::new(0.0, 0.0)),
-                window_shown: RefCell::new(false),
-                component,
-                adapter,
-            }
-        });
 
         Box::new(Instance { window_handle })
     }
