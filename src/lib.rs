@@ -2,7 +2,8 @@ use baseview::{
     gl::GlConfig, Event, Size, Window, WindowEvent as BaseviewWindowEvent, WindowHandle,
     WindowInfo, WindowOpenOptions, WindowScalePolicy,
 };
-use nih_plug::params::Param;
+use crossbeam::atomic::AtomicCell;
+use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::{Editor, GuiContext, ParamSetter};
 use once_cell::unsync::OnceCell;
 use slint::platform::femtovg_renderer::FemtoVGRenderer;
@@ -38,14 +39,14 @@ type SetupHandler<T> = dyn Fn(&WindowHandler<T>, &mut Window) + Send + Sync;
 ///     editor_state: Arc<SlintEditorState>,
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SlintEditorState {
     #[serde(default = "default_width")]
     pub width: u32,
     #[serde(default = "default_height")]
     pub height: u32,
-    #[serde(default = "default_scale")]
-    pub scale_factor: f32,
+    #[serde(with = "nih_plug::params::persist::serialize_atomic_cell")]
+    pub scale_factor: AtomicCell<f32>,
 }
 
 fn default_width() -> u32 {
@@ -58,12 +59,25 @@ fn default_scale() -> f32 {
     1.0
 }
 
+impl<'a> PersistentField<'a, SlintEditorState> for Arc<SlintEditorState> {
+    fn set(&self, new_value: SlintEditorState) {
+        self.scale_factor.store(new_value.scale_factor.load());
+    }
+
+    fn map<F, R>(&self, f: F) -> R
+    where
+        F: Fn(&SlintEditorState) -> R,
+    {
+        f(self)
+    }
+}
+
 impl Default for SlintEditorState {
     fn default() -> Self {
         Self {
             width: default_width(),
             height: default_height(),
-            scale_factor: default_scale(),
+            scale_factor: default_scale().into(),
         }
     }
 }
@@ -73,7 +87,7 @@ impl SlintEditorState {
         Self {
             width,
             height,
-            scale_factor: 1.0,
+            scale_factor: AtomicCell::new(1.0),
         }
     }
 
@@ -81,7 +95,7 @@ impl SlintEditorState {
         Self {
             width,
             height,
-            scale_factor,
+            scale_factor: AtomicCell::new(scale_factor),
         }
     }
 }
