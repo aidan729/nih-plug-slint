@@ -10,14 +10,7 @@ use slint::platform::femtovg_renderer::FemtoVGRenderer;
 use slint::platform::WindowAdapter;
 use slint::platform::WindowEvent;
 use slint::{LogicalPosition, PhysicalSize, SharedString};
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 pub use baseview::{DropData, DropEffect, EventStatus, MouseEvent};
 
@@ -42,10 +35,8 @@ type SetupHandler<T> = dyn Fn(&WindowHandler<T>, &mut Window) + Send + Sync;
 /// ```
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlintEditorState {
-    #[serde(default = "default_width")]
-    pub width: u32,
-    #[serde(default = "default_height")]
-    pub height: u32,
+    #[serde(with = "nih_plug::params::persist::serialize_atomic_cell")]
+    pub size: AtomicCell<(u32, u32)>,
     #[serde(with = "nih_plug::params::persist::serialize_atomic_cell")]
     pub scale_factor: AtomicCell<f32>,
 }
@@ -62,6 +53,7 @@ fn default_scale() -> f32 {
 
 impl<'a> PersistentField<'a, SlintEditorState> for Arc<SlintEditorState> {
     fn set(&self, new_value: SlintEditorState) {
+        self.size.store(new_value.size.load());
         self.scale_factor.store(new_value.scale_factor.load());
     }
 
@@ -76,8 +68,7 @@ impl<'a> PersistentField<'a, SlintEditorState> for Arc<SlintEditorState> {
 impl Default for SlintEditorState {
     fn default() -> Self {
         Self {
-            width: default_width(),
-            height: default_height(),
+            size: AtomicCell::new((default_width(), default_height())),
             scale_factor: default_scale().into(),
         }
     }
@@ -86,18 +77,21 @@ impl Default for SlintEditorState {
 impl SlintEditorState {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
-            width,
-            height,
+            size: AtomicCell::new((width, height)),
             scale_factor: AtomicCell::new(1.0),
         }
     }
 
     pub fn with_scale(width: u32, height: u32, scale_factor: f32) -> Self {
         Self {
-            width,
-            height,
+            size: AtomicCell::new((width, height)),
             scale_factor: AtomicCell::new(scale_factor),
         }
+    }
+
+    /// Returns a `(width, height)` pair for the current size of the GUI in logical pixels.
+    pub fn size(&self) -> (u32, u32) {
+        self.size.load()
     }
 }
 
@@ -123,37 +117,23 @@ impl SlintEditorState {
 /// ```
 pub struct SlintEditor<T: slint::ComponentHandle> {
     component_factory: Arc<dyn Fn() -> Result<T, slint::PlatformError> + Send + Sync>,
-    width: Arc<AtomicU32>,
-    height: Arc<AtomicU32>,
-    state: Option<Arc<SlintEditorState>>,
+    state: Arc<SlintEditorState>,
     event_loop_handler: Arc<EventLoopHandler<T>>,
     setup_handler: Arc<SetupHandler<T>>,
 }
 
 impl<T: slint::ComponentHandle + 'static> SlintEditor<T> {
-    /// Create an editor from a factory closure.  `size` is the default window size in
-    /// logical pixels; it's overridden by the persisted state if you call [`with_state`][Self::with_state].
-    pub fn with_factory<F>(factory: F, size: (u32, u32)) -> Self
+    /// Create an editor from state containing the window size and scale factor and a factory closure.
+    pub fn new<F>(state: Arc<SlintEditorState>, factory: F) -> Self
     where
         F: Fn() -> Result<T, slint::PlatformError> + 'static + Send + Sync,
     {
         Self {
             component_factory: Arc::new(factory),
-            width: Arc::new(AtomicU32::new(size.0)),
-            height: Arc::new(AtomicU32::new(size.1)),
-            state: None,
+            state,
             event_loop_handler: Arc::new(|_, _, _| {}),
             setup_handler: Arc::new(|_, _| {}),
         }
-    }
-
-    /// Load the initial window size from `state` and write back to it on resize.
-    /// Pass an `Arc<SlintEditorState>` stored under `#[persist]` in your params.
-    pub fn with_state(mut self, state: Arc<SlintEditorState>) -> Self {
-        self.width = Arc::new(AtomicU32::new(state.width));
-        self.height = Arc::new(AtomicU32::new(state.height));
-        self.state = Some(state);
-        self
     }
 
     pub fn with_setup<F>(mut self, handler: F) -> Self
@@ -325,10 +305,8 @@ pub struct WindowHandler<T: slint::ComponentHandle> {
     context: Arc<dyn GuiContext>,
     event_loop_handler: Arc<EventLoopHandler<T>>,
     setup_handler: Arc<SetupHandler<T>>,
-    pub width: Arc<AtomicU32>,
-    pub height: Arc<AtomicU32>,
     scale_factor: RefCell<f32>,
-    state: Option<Arc<SlintEditorState>>,
+    state: Arc<SlintEditorState>,
     // Rc so it can be shared with Slint callbacks without needing &mut self
     pending_resizes: Rc<RefCell<Vec<(u32, u32)>>>,
     last_cursor_pos: RefCell<LogicalPosition>,
@@ -345,8 +323,7 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
         let physical_width = (width as f32 * scale) as u32;
         let physical_height = (height as f32 * scale) as u32;
 
-        self.width.store(width, Ordering::Relaxed);
-        self.height.store(height, Ordering::Relaxed);
+        self.state.size.store((width, height));
 
         // Update adapter with physical size and scale factor
         self.adapter
@@ -370,21 +347,6 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
             width: width as f64,
             height: height as f64,
         });
-
-        // Persist the new size if state is available.
-        //
-        // SAFETY: We write through an Arc that is shared with the audio thread.
-        // This is technically a data race if the audio thread reads width/height concurrently.
-        // In practice NIH-plug only reads these fields from the GUI thread (in `spawn`),
-        // so there is no concurrent access.  A future improvement would be to store these
-        // as `AtomicU32` fields inside `SlintEditorState`.
-        if let Some(state) = &self.state {
-            let state_ptr = Arc::as_ptr(state) as *mut SlintEditorState;
-            unsafe {
-                (*state_ptr).width = width;
-                (*state_ptr).height = height;
-            }
-        }
     }
 
     /// Handle a window info update from baseview (scale factor or size change)
@@ -400,10 +362,9 @@ impl<T: slint::ComponentHandle> WindowHandler<T> {
 
         // Update our logical size tracking
         let logical_size = info.logical_size();
-        self.width
-            .store(logical_size.width as u32, Ordering::Relaxed);
-        self.height
-            .store(logical_size.height as u32, Ordering::Relaxed);
+        self.state
+            .size
+            .store((logical_size.width as u32, logical_size.height as u32));
 
         // Notify Slint of the new size (logical)
         self.adapter
@@ -692,11 +653,12 @@ impl<T: slint::ComponentHandle + 'static> Editor for SlintEditor<T> {
         parent: nih_plug::prelude::ParentWindowHandle,
         context: Arc<dyn GuiContext>,
     ) -> Box<dyn std::any::Any + Send> {
+        let (width, height) = self.state.size();
         let options = WindowOpenOptions {
             scale: WindowScalePolicy::SystemScaleFactor,
             size: Size {
-                width: self.width.load(Ordering::Relaxed) as f64,
-                height: self.height.load(Ordering::Relaxed) as f64,
+                width: width as f64,
+                height: height as f64,
             },
             title: "Plug-in".to_owned(),
             // Request OpenGL context for FemtoVG rendering
@@ -716,8 +678,6 @@ impl<T: slint::ComponentHandle + 'static> Editor for SlintEditor<T> {
             }),
         };
 
-        let width = self.width.clone();
-        let height = self.height.clone();
         let state = self.state.clone();
         let event_loop_handler = self.event_loop_handler.clone();
         let setup_handler = self.setup_handler.clone();
@@ -733,10 +693,7 @@ impl<T: slint::ComponentHandle + 'static> Editor for SlintEditor<T> {
                 // Start with scale 1.0; the actual system scale arrives via the first
                 // WindowEvent::Resized from baseview.
                 let initial_scale = 1.0f32;
-                let logical_width = width.load(Ordering::Relaxed);
-                let logical_height = height.load(Ordering::Relaxed);
-                let adapter =
-                    BaseviewSlintAdapter::new(logical_width, logical_height, initial_scale);
+                let adapter = BaseviewSlintAdapter::new(width, height, initial_scale);
 
                 // Wire up the GL proc-address loader now that the context is live.
                 adapter.set_gl_context(baseview_window);
@@ -760,8 +717,6 @@ impl<T: slint::ComponentHandle + 'static> Editor for SlintEditor<T> {
                     context,
                     event_loop_handler,
                     setup_handler,
-                    width,
-                    height,
                     scale_factor: RefCell::new(initial_scale),
                     state,
                     pending_resizes: Rc::new(RefCell::new(Vec::new())),
@@ -777,10 +732,7 @@ impl<T: slint::ComponentHandle + 'static> Editor for SlintEditor<T> {
     }
 
     fn size(&self) -> (u32, u32) {
-        (
-            self.width.load(Ordering::Relaxed),
-            self.height.load(Ordering::Relaxed),
-        )
+        self.state.size()
     }
 
     fn set_scale_factor(&self, _factor: f32) -> bool {
