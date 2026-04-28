@@ -29,10 +29,17 @@ struct MyParams {
     editor_state: Arc<SlintEditorState>,
 }
 
+impl Default for MyParams {
+  fn default() -> Self {
+    Self {
+      editor_state: Arc::new(SlintEditorState::new(400, 300)),
+    }
+  }
+}
+
 fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
     Some(Box::new(
-        SlintEditor::with_factory(|| gui::AppWindow::new(), (400, 300))
-            .with_state(self.params.editor_state.clone())
+        SlintEditor::new(params.editor_state.clone(), || gui::AppWindow::new())
             .with_setup({
                 let params = self.params.clone();
                 move |handler, _window| {
@@ -61,11 +68,18 @@ fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Edi
 
 ## API
 
+### `SlintEditorState`
+
+Holds `width`, `height` and `scale_factor`. Construct with `Arc::new(SlintEditorState::new(w, h))`. It should be stored on your params struct with the `#[persist]` attribute to persist the state.
+
 ### `SlintEditor`
 
-Created with `SlintEditor::with_factory(factory, (width, height))`. The factory closure is called each time the window is opened.
+Created with `SlintEditor::new(state, factory)`.
 
-- `.with_state(Arc<SlintEditorState>)` - load the initial size from persisted state and write back to it on resize. The state needs to be stored in your params struct under `#[persist]`.
+The first argument is the editor state which comes from the params struct. See [SlintEditorState](#slinteditorstate).
+
+The second argument is the factory closure which is called each time the window is opened.
+
 - `.with_setup(handler)` - called once when the window opens, before the event loop starts. Use this to register UI → plugin callbacks.
 - `.with_event_loop(handler)` - called every frame. Use this to push parameter values to the UI (plugin → UI).
 
@@ -86,10 +100,6 @@ component.on_resize(move || {
     pending.borrow_mut().push((800, 600));
 });
 ```
-
-### `SlintEditorState`
-
-Holds `width`, `height`, and `scale_factor`. Construct with `SlintEditorState::new(w, h)` or `SlintEditorState::with_scale(w, h, scale)`.
 
 ## Architecture
 

@@ -7,6 +7,7 @@ This document explains how the Slint/baseview bridge works. Most users won't nee
 NIH-plug's `Editor` trait requires implementing `spawn()`, which is called by the host to open the plugin window. We use baseview for the actual OS window, and Slint's FemtoVG renderer (OpenGL) for drawing the UI.
 
 The tricky parts are:
+
 1. Slint needs to be told which platform/renderer to use, and it can only be set once per process
 2. The OpenGL context doesn't exist until baseview creates the window, but Slint may try to create the renderer earlier
 3. Window close/reopen cycles need to work correctly
@@ -15,7 +16,7 @@ The tricky parts are:
 
 ### `SlintEditor<T>`
 
-The public-facing struct that implements `Editor`. It holds the component factory, default size, optional persisted state, and the event loop handler. Nothing interesting happens here until `spawn()` is called.
+The public-facing struct that implements `Editor`. It holds the state, component factory and the event loop handler. Nothing interesting happens here until `spawn()` is called.
 
 ### `WindowHandler<T>`
 
@@ -36,6 +37,7 @@ Implements `slint::platform::femtovg_renderer::OpenGLInterface`. Mostly no-ops s
 ## How window open/close/reopen works
 
 When `spawn()` is called:
+
 1. We create a `BaseviewSlintAdapter` and store it in `CURRENT_ADAPTER`
 2. We call `slint::platform::set_platform()` - this only takes effect the first time; subsequent calls are silently ignored by Slint
 3. When Slint creates the component and calls `create_window_adapter()`, it gets the adapter we just stored
@@ -54,7 +56,7 @@ We also explicitly re-initialize the renderer at the start of the first `on_fram
 
 ## State persistence
 
-`SlintEditorState` is stored in the plugin's params struct under `#[persist]`, which means NIH-plug/the host handles serialization. We update the `width` and `height` fields directly through the `Arc` when the window is resized - this is technically a data race if the audio thread reads those fields at the same time, but in practice NIH-plug only reads them from the GUI thread.
+`SlintEditorState` is stored in the plugin's params struct under `#[persist]`, which means NIH-plug/the host handles serialization. We update the `width` and `height` fields directly through the `Arc` when the window is resized.
 
 ## Resize handling
 
@@ -65,8 +67,41 @@ There are two resize paths:
 
 `resize()` updates the internal size, notifies Slint, tells the host via `context.request_resize()`, and then actually resizes the baseview window.
 
+## Keyboard events
+
+All keyboard events are consumed by the plugin host application by default. You can let your plugin consume keyboard events instead when needed. This is what you would want for text input components for example. The events won't get propagated to the plugin host when the plugin consumes the keyboard events.
+
+To enable keyboard events you need to add a property to the Slint application first. Set this property to true from within the Slint application whenever you need to process keyboard events.
+
+```slint
+export component AppWindow inherits Window {
+    in-out property <bool> keyboard_input_is_enabled: bool;
+}
+```
+
+In the `.with_event_loop` handler you can then read this property and set the `keyboard_input_is_enabled` state on the window_handler. The window_handler takes care of processing the keyboard events.
+
+```rust
+fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+    Some(Box::new(
+        SlintEditor::new(params.editor_state.clone(), || gui::AppWindow::new())
+            .with_event_loop({
+                let params = self.params.clone();
+                move |handler, _setter, _window| {
+                    // Pass the keyboard_input_is_enabled state to the window handler
+                    window_handler.set_keyboard_input_is_enabled(
+                        component.get_keyboard_input_is_enabled(),
+                    );
+                }
+            }),
+    ))
+}
+```
+
+Don't forget to set the `keyboard_input_is_enabled` state back to false from your Slint application when your plugin no longer needs keyboard input.
+
 ## Data flow
 
 **Plugin → UI:** Read parameter values in the `with_event_loop` handler and push them to Slint component properties each frame.
 
-**UI → Plugin:** Register Slint callbacks (e.g. `component.on_gain_changed(...)`) using `with_setup`. This runs once when the window first opens, before the event loop starts. Prefer this over registering callbacks in `with_event_loop`, since re-registering every frame is wasteful even if harmless. 
+**UI → Plugin:** Register Slint callbacks (e.g. `component.on_gain_changed(...)`) using `with_setup`. This runs once when the window first opens, before the event loop starts. Prefer this over registering callbacks in `with_event_loop`, since re-registering every frame is wasteful even if harmless.

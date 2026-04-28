@@ -97,15 +97,13 @@ impl SlintEditorState {
 
 /// The NIH-plug [`Editor`] implementation for Slint UIs.
 ///
-/// Build one with [`SlintEditor::with_factory`], optionally chaining
-/// [`with_state`][Self::with_state] for window-size persistence and
+/// Build one with [`SlintEditor::new`], optionally chaining
 /// [`with_event_loop`][Self::with_event_loop] to sync parameters each frame.
 ///
 /// ```rust,ignore
 /// fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
 ///     Some(Box::new(
-///         SlintEditor::with_factory(|| gui::AppWindow::new(), (400, 300))
-///             .with_state(self.params.editor_state.clone())
+///         SlintEditor::new(self.params.editor_state.clone(), || gui::AppWindow::new(), (400, 300))
 ///             .with_event_loop({
 ///                 let params = self.params.clone();
 ///                 move |handler, _setter, _window| {
