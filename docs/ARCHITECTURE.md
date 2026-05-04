@@ -77,11 +77,11 @@ To control propagation, add a property to your Slint component and toggle it whe
 
 ```slint
 export component AppWindow inherits Window {
-    in-out property <bool> keyboard_input_is_enabled: bool;
+    in-out property <bool> prevent_key_event_propagation: bool;
 }
 ```
 
-In the `.with_event_loop` handler, sync this property to `set_keyboard_input_is_enabled` on the handler. When `true`, key events are returned as `Captured` (host doesn't see them); when `false`, they're returned as `Ignored` (host sees them too).
+In the `.with_event_loop` handler, sync this property to `set_prevent_key_event_propagation` on the handler. When `true`, key events are returned as `Captured` (host doesn't see them); when `false`, they're returned as `Ignored` (host sees them too).
 
 ```rust
 fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
@@ -89,8 +89,8 @@ fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Edi
         SlintEditor::new(self.params.editor_state.clone(), || gui::AppWindow::new())
             .with_event_loop({
                 move |handler, _setter, _window| {
-                    handler.set_keyboard_input_is_enabled(
-                        handler.component().get_keyboard_input_is_enabled(),
+                    handler.set_prevent_key_event_propagation(
+                        handler.component().get_prevent_key_event_propagation(),
                     );
                 }
             }),
@@ -98,7 +98,7 @@ fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Edi
 }
 ```
 
-Set `keyboard_input_is_enabled` back to false once the component no longer needs exclusive key input.
+Set `prevent_key_event_propagation` back to false once the component no longer needs exclusive key input.
 
 ## Data flow
 
